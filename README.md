@@ -85,8 +85,27 @@ projet est long, ajouter `--target-dir C:\bsb-target` : le *build script* de
 4. Pour garder l'icône visible : Paramètres → Personnalisation → Barre des tâches →
    Autres icônes de la barre d'état système → activer *blackshark-battery*.
 
+Lancer l'exécutable depuis l'Explorateur (ou le raccourci), pas depuis un terminal :
+sous Windows, un processus lancé par un shell/IDE meurt avec son parent, ce qui donne
+l'impression que l'icône « s'est fermée toute seule ».
+
 Synapse peut rester installé : le canal HID est ouvert en mode partagé, et les
 notifications sont diffusées à tous les processus qui l'ont ouvert.
+
+### Journal
+
+L'application écrit `%LOCALAPPDATA%\BlackSharkBattery\app.log` (rotation à 200 Ko) :
+
+```
+2026-11-17 17:07:18 [43244] démarrage
+2026-11-17 17:07:18 [43244] canal 0xFF14 ouvert
+```
+
+Elle y note le démarrage, l'ouverture et la perte du canal HID, la fin de session
+Windows, l'arrêt par le menu, les paniques et le refus de seconde instance. Sans ce
+fichier, une terminaison externe ne laisse aucune trace : `WerSvc` n'est pas toujours
+actif, et le Gestionnaire d'événements ne mentionne rien. Si l'icône disparaît encore,
+la dernière ligne du journal dit exactement ce qui s'est passé.
 
 ## Configuration (`blackshark-battery.ini`, à côté de l'exe)
 

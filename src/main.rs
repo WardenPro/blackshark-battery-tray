@@ -2,6 +2,7 @@
 #![windows_subsystem = "windows"]
 
 use blackshark_battery::{config::Config, hid, protocol};
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -9,6 +10,7 @@ use std::{mem, ptr};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::HiDpi::*;
 use windows_sys::Win32::UI::Shell::*;
@@ -55,11 +57,35 @@ fn copy_wide(dst: &mut [u16], s: &str) {
     dst[v.len()] = 0;
 }
 
-/// Dernier niveau connu, conservé entre deux lancements (le casque ne notifie qu'aux changements).
-fn cache_path() -> Option<std::path::PathBuf> {
+/// Dossier de travail : cache du niveau et journal.
+fn data_dir() -> Option<std::path::PathBuf> {
     let dir = std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("BlackSharkBattery");
     std::fs::create_dir_all(&dir).ok()?;
-    Some(dir.join("last_level.txt"))
+    Some(dir)
+}
+
+/// Dernier niveau connu, conservé entre deux lancements (le casque ne notifie qu'aux changements).
+fn cache_path() -> Option<std::path::PathBuf> {
+    Some(data_dir()?.join("last_level.txt"))
+}
+
+/// Journal minimal (`app.log`, à côté du cache) : démarrages, arrêts, pertes du dongle.
+/// Sans lui, une fermeture inexpliquée ne laisse aucune trace.
+fn log(msg: &str) {
+    let Some(dir) = data_dir() else { return };
+    let path = dir.join("app.log");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 200_000) {
+        let _ = std::fs::remove_file(&path);
+    }
+    let mut st: SYSTEMTIME = unsafe { mem::zeroed() };
+    unsafe { GetLocalTime(&mut st) };
+    let line = format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} [{}] {msg}\n",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, std::process::id()
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = f.write_all(line.as_bytes());
+    }
 }
 
 fn save_level(p: u8) {
@@ -109,11 +135,28 @@ fn find_device() -> Result<Option<hid::Device>, u32> {
 fn worker() {
     let c = cfg();
     let poll = Duration::from_millis(c.poll_ms as u64);
+    let mut absent = false;
+    let mut last_err: Option<u32> = None;
     loop {
         let dev = match find_device() {
-            Ok(Some(d)) => d,
-            Ok(None) => { set_status(Status::NoDongle); std::thread::sleep(poll); continue; }
-            Err(code) => { set_status(Status::Error(code)); std::thread::sleep(poll.max(Duration::from_secs(5))); continue; }
+            Ok(Some(d)) => {
+                log("canal 0xFF14 ouvert");
+                absent = false;
+                last_err = None;
+                d
+            }
+            Ok(None) => {
+                if !absent { log("dongle absent"); absent = true; }
+                set_status(Status::NoDongle);
+                std::thread::sleep(poll);
+                continue;
+            }
+            Err(code) => {
+                if last_err != Some(code) { log(&format!("ouverture du dongle impossible (code {code})")); last_err = Some(code); }
+                set_status(Status::Error(code));
+                std::thread::sleep(poll.max(Duration::from_secs(5)));
+                continue;
+            }
         };
         // On garde le dernier niveau connu s'il existe, sinon on attend la première mesure.
         {
@@ -147,7 +190,11 @@ fn worker() {
                         set_status(Status::Level(level, Instant::now()));
                     }
                 }
-                Err(_) => break, // dongle retiré : on repasse en détection
+                Err(e) => {
+                    // Dongle retiré ou canal invalidé : on journalise puis on repasse en détection.
+                    log(&format!("canal perdu ({:?})", e.raw_os_error()));
+                    break;
+                }
             }
         }
         drop(dev);
@@ -304,12 +351,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             match wp & 0xFFFF {
                 ID_REFRESH => REFRESH.store(true, Ordering::Relaxed),
                 ID_RESYNC => RESYNC.store(true, Ordering::Relaxed),
-                ID_QUIT => { DestroyWindow(hwnd); }
+                ID_QUIT => { log("quitter via le menu"); DestroyWindow(hwnd); }
                 _ => {}
             }
             0
         }
+        WM_ENDSESSION => {
+            if wp != 0 { log("fin de session Windows"); }
+            0
+        }
         WM_DESTROY => {
+            log("arrêt (WM_DESTROY)");
             let mut nid: NOTIFYICONDATAW = mem::zeroed();
             nid.cbSize = mem::size_of::<NOTIFYICONDATAW>() as u32;
             nid.hWnd = hwnd;
@@ -324,21 +376,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 }
 
 fn main() {
+    // Journalise les paniques : sans ça, l'app disparaît sans laisser de trace.
+    std::panic::set_hook(Box::new(|info| log(&format!("PANIQUE : {info}"))));
+    log("démarrage");
     unsafe {
         // Une seule instance à la fois.
         CreateMutexW(ptr::null(), 1, wide("Local\\BlackSharkBatteryTray").as_ptr());
-        if GetLastError() == ERROR_ALREADY_EXISTS { return; }
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            log("une autre instance tourne déjà, arrêt");
+            return;
+        }
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
     CONFIG.set(Config::load()).unwrap();
     let initial = load_level();
-    std::thread::spawn(move || {
-        // Si le dongle est présent, on affiche la dernière valeur connue (grisée si ancienne).
-        if let (Some(s), Ok(Some(_))) = (initial, find_device()) { *STATUS.lock().unwrap() = s; }
-        worker()
-    });
 
-    unsafe {
+    let _hwnd = unsafe {
         let hinst = GetModuleHandleW(ptr::null());
         let class = wide("BlackSharkBatteryTray");
         let mut wc: WNDCLASSW = mem::zeroed();
@@ -353,11 +406,22 @@ fn main() {
         update_tray(hwnd, false);
         // Rafraîchit l'infobulle (âge de la mesure) toutes les 30 s.
         SetTimer(hwnd, TIMER_ID, 30_000, None);
+        hwnd
+    };
 
+    // Le canal HID n'est ouvert qu'une fois la fenêtre créée : le premier niveau affiché
+    // (issu du cache) déclenche ainsi un vrai rafraîchissement de l'icône au démarrage.
+    std::thread::spawn(move || {
+        if let (Some(s), Ok(Some(_))) = (initial, find_device()) { set_status(s); }
+        worker()
+    });
+
+    unsafe {
         let mut msg: MSG = mem::zeroed();
         while GetMessageW(&mut msg, ptr::null_mut(), 0, 0) > 0 {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        log("fin du programme");
     }
 }
